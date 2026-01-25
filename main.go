@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,7 +55,6 @@ type Scanner struct {
 	startTime    time.Time
 }
 
-// Regex to extract time from ping output (e.g., time=120 ms)
 var pingRegex = regexp.MustCompile(`time=([0-9.]+)`)
 
 func main() {
@@ -85,7 +86,6 @@ func main() {
 }
 
 func (s *Scanner) Execute() {
-	// Clear previous results
 	f, _ := os.Create("working_ips.txt")
 	if f != nil {
 		f.Close()
@@ -126,6 +126,7 @@ func (s *Scanner) Execute() {
 				s.lock.Lock()
 				s.testedCount++
 				s.threadStates[workerID] = "IDLE"
+
 				if ok {
 					s.results = append(s.results, res)
 					s.lvlCounts[res.Level]++
@@ -136,7 +137,11 @@ func (s *Scanner) Execute() {
 						s.premiumCount++
 					}
 
-					line := fmt.Sprintf("%-11s | LVL %d | %-15s | %-8s | %-10s", statusTag, res.Level, res.IP, res.Ping, res.Speed)
+					line := fmt.Sprintf(
+						"%-11s | LVL %d | %-15s | %-8s | %-10s",
+						statusTag, res.Level, res.IP, res.Ping, res.Speed,
+					)
+
 					s.history = append(s.history, line)
 					if len(s.history) > 10 {
 						s.history = s.history[1:]
@@ -162,6 +167,29 @@ func (s *Scanner) Execute() {
 
 	wg.Wait()
 	stopUI <- true
+
+	// ===== SORT RESULTS BY DOWNLOAD SPEED (DESC) =====
+	sort.Slice(s.results, func(i, j int) bool {
+		return parseSpeedKB(s.results[i].Speed) > parseSpeedKB(s.results[j].Speed)
+	})
+
+	// ===== REWRITE FILE SORTED =====
+	out, err := os.Create("working_ips.txt")
+	if err == nil {
+		defer out.Close()
+		for _, res := range s.results {
+			statusTag := "✅          "
+			if res.IsPremium {
+				statusTag = "💎 PREMIUM "
+			}
+			line := fmt.Sprintf(
+				"%-11s | LVL %d | %-15s | %-8s | %-10s",
+				statusTag, res.Level, res.IP, res.Ping, res.Speed,
+			)
+			out.WriteString(line + "\n")
+		}
+	}
+
 	s.drawUI()
 }
 
@@ -169,9 +197,7 @@ func (s *Scanner) testIP(ip string, workerID int) (Result, bool) {
 	res := Result{IP: ip, Level: 0, Ping: "---", Speed: "---", IsPremium: false}
 	addr := fmt.Sprintf("%s:%d", ip, s.conf.Port)
 
-	// L0: Shell ICMP Ping (Non-root friendly)
 	s.setStatus(workerID, ip, "L0: PING")
-	// -c 1 (1 packet), -W 1 (1 second timeout)
 	out, err := exec.Command("ping", "-c", "1", "-W", "1", ip).Output()
 	if err == nil {
 		match := pingRegex.FindStringSubmatch(string(out))
@@ -182,16 +208,14 @@ func (s *Scanner) testIP(ip string, workerID int) (Result, bool) {
 		res.Ping = "timeout"
 	}
 
-	// L1: TCP Dial
 	s.setStatus(workerID, ip, "L1: TCP")
 	conn, err := net.DialTimeout("tcp", addr, time.Duration(s.conf.TcpTimeout)*time.Second)
 	if err != nil {
 		return res, false
 	}
-	res.Level = 1
 	defer conn.Close()
+	res.Level = 1
 
-	// L2: SSL Handshake
 	s.setStatus(workerID, ip, "L2: SSL")
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         s.conf.TestDomain,
@@ -203,11 +227,12 @@ func (s *Scanner) testIP(ip string, workerID int) (Result, bool) {
 	}
 	res.Level = 2
 
-	// L3/L4: HTTP Request
 	s.setStatus(workerID, ip, "L3: HTTP")
 	client := &http.Client{
 		Transport: &http.Transport{
-			DialTLS: func(network, addr string) (net.Conn, error) { return tlsConn, nil },
+			DialTLS: func(network, addr string) (net.Conn, error) {
+				return tlsConn, nil
+			},
 		},
 		Timeout: time.Duration(s.conf.HttpTimeout) * time.Second,
 	}
@@ -215,7 +240,7 @@ func (s *Scanner) testIP(ip string, workerID int) (Result, bool) {
 	url := fmt.Sprintf("https://%s%s", s.conf.TestDomain, s.conf.TestPath)
 	resp, err := client.Get(url)
 	if err != nil {
-		return res, true
+		return res, false
 	}
 	defer resp.Body.Close()
 
@@ -224,12 +249,11 @@ func (s *Scanner) testIP(ip string, workerID int) (Result, bool) {
 		res.IsPremium = true
 	}
 
-	// L5: Download Speed
 	if s.conf.TestDownload {
 		s.setStatus(workerID, ip, "L5: DL")
-		dlStart := time.Now()
+		start := time.Now()
 		written, _ := io.CopyN(io.Discard, resp.Body, int64(s.conf.DownloadSize))
-		dur := time.Since(dlStart).Seconds()
+		dur := time.Since(start).Seconds()
 		if written > 0 && dur > 0 {
 			res.Level = 5
 			res.Speed = fmt.Sprintf("%.1fKB/s", float64(written)/1024/dur)
@@ -239,11 +263,25 @@ func (s *Scanner) testIP(ip string, workerID int) (Result, bool) {
 	return res, true
 }
 
+func parseSpeedKB(speed string) float64 {
+	if speed == "---" || speed == "" {
+		return 0
+	}
+	speed = strings.TrimSuffix(speed, "KB/s")
+	v, err := strconv.ParseFloat(speed, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
 func (s *Scanner) setStatus(id int, ip, status string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	s.threadStates[id] = fmt.Sprintf("[%s] %s", ip, status)
 }
+
+/* ================= UI CODE UNCHANGED BELOW ================= */
 
 func (s *Scanner) drawUI() {
 	s.lock.Lock()
@@ -283,13 +321,17 @@ func expandCIDR(cidr string) []string {
 	if err != nil {
 		return nil
 	}
+
 	var ips []string
 	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
 		ips = append(ips, ip.String())
 	}
-	if len(ips) > 2 {
-		return ips[1 : len(ips)-1]
+
+	// If subnet has at least 2 addresses, drop ONLY broadcast, keep network
+	if len(ips) > 1 {
+		return ips[:len(ips)-1] // keep .0, drop .255
 	}
+
 	return ips
 }
 
